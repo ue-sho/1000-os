@@ -1,6 +1,20 @@
 #include "kernel.h"
 #include "common.h"
 
+extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
+
+__attribute__((naked)) void user_entry(void) {
+    __asm__ __volatile__(
+        "csrw sepc, %[sepc]\n"
+        "csrw sstatus, %[sstatus]\n"
+        "sret\n"
+        :
+        : [sepc] "r" (USER_BASE),
+          [sstatus] "r" (SSTATUS_SPIE)
+    );
+}
+
+
 extern char __bss[], __bss_end[], __stack_top[];
 
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
@@ -84,7 +98,29 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
     );
 }
 
-struct process *create_process(uint32_t pc) {
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
+    if (!is_aligned(vaddr, PAGE_SIZE))
+        PANIC("unaligned vaddr %x", vaddr);
+
+    if (!is_aligned(paddr, PAGE_SIZE))
+        PANIC("unaligned paddr %x", paddr);
+
+    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
+    if ((table1[vpn1] & PAGE_V) == 0) {
+        // 2段目のページテーブルが存在しないので作成する
+        uint32_t pt_paddr = alloc_pages(1);
+        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+    }
+
+    // 2段目のページテーブルにエントリを追加する
+    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
+    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+}
+
+extern char __kernel_base[];
+
+struct process *create_process(const void *image, size_t image_size) {
     // 空いているプロセス管理構造体を探す
     struct process *proc = NULL;
     int i;
@@ -112,12 +148,37 @@ struct process *create_process(uint32_t pc) {
     *--sp = 0;                      // s2
     *--sp = 0;                      // s1
     *--sp = 0;                      // s0
-    *--sp = (uint32_t) pc;          // ra
+    *--sp = (uint32_t) user_entry;  // ra
+
+    uint32_t *page_table = (uint32_t *) alloc_pages(1);
+
+    // カーネルのページをマッピングする
+    for (paddr_t paddr = (paddr_t) __kernel_base;
+         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+
+    // ユーザーのページをマッピングする
+    for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
+        paddr_t page = alloc_pages(1);
+
+        // コピーするデータがページサイズより小さい場合を考慮
+        // https://github.com/nuta/operating-system-in-1000-lines/pull/27
+        size_t remaining = image_size - off;
+        size_t copy_size = PAGE_SIZE <= remaining ? PAGE_SIZE : remaining;
+
+        // 確保したページにデータをコピー
+        memcpy((void *) page, image + off, copy_size);
+
+        // ページテーブルにマッピング
+        map_page(page_table, USER_BASE + off, page,
+                 PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+    }
 
     // 各フィールドを初期化
     proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
     proc->sp = (uint32_t) sp;
+    proc->page_table = page_table;
     return proc;
 }
 
@@ -141,9 +202,13 @@ void yield(void) {
         return;
 
     __asm__ __volatile__(
+        "sfence.vma\n"
+        "csrw satp, %[satp]\n"
+        "sfence.vma\n"
         "csrw sscratch, %[sscratch]\n"
         :
-        : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
+          [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
     );
 
     // コンテキストスイッチ
@@ -278,17 +343,11 @@ void kernel_main(void) {
 
     WRITE_CSR(stvec, (uint32_t) kernel_entry);
 
-    paddr_t paddr0 = alloc_pages(2);
-    paddr_t paddr1 = alloc_pages(1);
-    printf("alloc_pages test: paddr0=%x\n", paddr0);
-    printf("alloc_pages test: paddr1=%x\n", paddr1);
-
-    idle_proc = create_process((uint32_t) NULL);
+    idle_proc = create_process(NULL, 0);
     idle_proc->pid = 0; // idle
     current_proc = idle_proc;
 
-    proc_a = create_process((uint32_t) proc_a_entry);
-    proc_b = create_process((uint32_t) proc_b_entry);
+    create_process(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
 
     yield();
     PANIC("switched to idle process!");
